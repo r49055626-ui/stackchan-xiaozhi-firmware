@@ -442,7 +442,7 @@ bool EspVideo::Capture() {
                 {
                     auto src16 = (uint16_t*)mmap_buffers_[buf.index].start;
                     auto dst16 = (uint16_t*)frame_.data;
-                    size_t count = (size_t)mmap_buffers_[buf.index].length / 2;
+                    size_t count = (size_t)buf.bytesused / 2;
                     for (size_t i = 0; i < count; i++) {
                         dst16[i] = __builtin_bswap16(src16[i]);
                     }
@@ -460,7 +460,7 @@ bool EspVideo::Capture() {
                     {
                         auto src16 = (uint16_t*)mmap_buffers_[buf.index].start;
                         auto dst16 = (uint16_t*)frame_.data;
-                        size_t count = (size_t)mmap_buffers_[buf.index].length / 2;
+                        size_t count = (size_t)buf.bytesused / 2;
                         for (size_t i = 0; i < count; i++) {
                             dst16[i] = __builtin_bswap16(src16[i]);
                         }
@@ -943,6 +943,9 @@ std::string EspVideo::Explain(const std::string& question) {
 
     auto network = Board::GetInstance().GetNetwork();
     auto http = network->CreateHttp(3);
+    // Do not block the device/WebSocket task for the gateway keepalive window
+    // when the camera endpoint is unreachable or slow.
+    http->SetTimeout(8000);
     // 构造multipart/form-data请求体
     std::string boundary = "----ESP32_CAMERA_BOUNDARY";
 

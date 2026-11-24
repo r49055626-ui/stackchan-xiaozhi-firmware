@@ -8,6 +8,7 @@
 #include "axp2101.h"
 #include "mcp_server.h"
 #include "notify_http_server.h"
+#include "M5IOE1.h"
 
 #include <esp_log.h>
 #include <esp_heap_caps.h>
@@ -25,6 +26,8 @@
 #include "i2c_bus.h"
 #include "bmi270_api.h"
 #include "bmi2.h"
+
+#include <algorithm>
 
 // BMI270 SDK 在 .a 里有这些 public 符号但头文件未暴露——自己声明用来绕过 bmi270_sensor_create 硬编码 0x68 的限制
 extern "C" {
@@ -76,8 +79,7 @@ public:
         args.name = "servo_idle";
         args.skip_unhandled_events = true;
         esp_timer_create(&args, &idle_timer_);
-        esp_timer_start_periodic(idle_timer_, 4000000);
-        scan_running_ = true;
+        scan_running_ = false;
         return true;
     }
 
@@ -90,8 +92,13 @@ public:
         int pitch_pos = 620 + pitch_deg * 16 / 5;
         ESP_LOGI("Servo", "MoveTo yaw=%d pitch=%d t=%d (caller=%p)",
                  yaw_deg, pitch_deg, time_ms, __builtin_return_address(0));
-        bus_.WritePos(1, yaw_pos, time_ms, 0);
-        bus_.WritePos(2, pitch_pos, time_ms, 0);
+        const int yaw_result = bus_.WritePos(1, yaw_pos, time_ms, 0);
+        const int pitch_result = bus_.WritePos(2, pitch_pos, time_ms, 0);
+        ESP_LOGI("Servo", "WritePos results: yaw=%d pitch=%d", yaw_result, pitch_result);
+        if (yaw_result < 0 || pitch_result < 0) {
+            ESP_LOGE("Servo", "servo command failed; check bus wiring, power, and IDs");
+            return;
+        }
         // 记当前命令位置——Nod/Shake 动画用这个作 base，而不是 tracker_->GetYaw()
         // 后者只反映人脸追踪目标，不反映 MCP head.move 设的硬位置。
         last_yaw_deg_ = yaw_deg;
@@ -106,10 +113,9 @@ public:
     }
 
     void ResumeScan() {
-        if (!scan_running_ && idle_timer_) {
-            esp_timer_start_periodic(idle_timer_, 4000000);
-            scan_running_ = true;
-        }
+        // Keep the head still while idle; explicit head commands and animations
+        // remain available through the MCP tools.
+        scan_running_ = false;
     }
 
     void Center() { MoveTo(0, 30, 600); }
@@ -444,16 +450,23 @@ public:
         w_ = w; h_ = h;
         size_t bytes = (size_t)w * h * 2;
         buf_ = (uint8_t*)heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM);
-        if (!buf_) return false;
+        if (!buf_) {
+            ESP_LOGE(TAG, "Avatar canvas allocation failed: need %u bytes, PSRAM free %u",
+                     (unsigned)bytes,
+                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+            return false;
+        }
         canvas_ = lv_canvas_create(parent);
         lv_canvas_set_buffer(canvas_, buf_, w, h, LV_COLOR_FORMAT_RGB565);
         lv_obj_align(canvas_, LV_ALIGN_TOP_LEFT, 0, 0);
         lv_obj_clear_flag(canvas_, LV_OBJ_FLAG_SCROLLABLE);
-        lv_obj_move_background(canvas_);
+        // Keep the custom avatar above the stock emoji/status widgets.
+        lv_obj_move_foreground(canvas_);
         timer_ = lv_timer_create(&LvglAvatar::TimerCb, 50, this);
         next_blink_ms_ = 3000;
         last_saccade_ms_ = 0;
         Draw();
+        ESP_LOGI(TAG, "Avatar canvas ready: %dx%d, %u bytes", w, h, (unsigned)bytes);
         return true;
     }
 
@@ -465,8 +478,39 @@ public:
 
     bool IsReady() const { return canvas_ != nullptr; }
 
-    void SetExpression(Expression e) { expression_ = e; }
+    void BringToFront() {
+        if (canvas_) lv_obj_move_foreground(canvas_);
+    }
+
+    void SetExpression(Expression e) {
+        expression_ = e;
+        manual_mouth_ = false;
+    }
     void SetOverlay(const Overlay& o) { overlay_ = o; }
+    void SetBlinkEnabled(bool enabled) {
+        blink_enabled_ = enabled;
+        if (!enabled) {
+            eye_closed_ = false;
+            eye_open_ratio_ = 1.0f;
+        }
+    }
+    void SetMouthShape(const char* shape) {
+        if (!shape) return;
+        if (!strcmp(shape, "closed")) {
+            manual_mouth_open_ = 0.0f;
+        } else if (!strcmp(shape, "half")) {
+            manual_mouth_open_ = 0.5f;
+        } else if (!strcmp(shape, "open")) {
+            manual_mouth_open_ = 1.0f;
+        } else if (!strcmp(shape, "e")) {
+            manual_mouth_open_ = 0.35f;
+        } else if (!strcmp(shape, "u")) {
+            manual_mouth_open_ = 0.75f;
+        } else {
+            return;
+        }
+        manual_mouth_ = true;
+    }
     void StartSpeaking(uint32_t duration_ms) {
         speaking_until_ms_ = lv_tick_get() + duration_ms;
     }
@@ -546,7 +590,7 @@ private:
             breath_ = sinf((tick_count_ % breath_period_steps_) * 2.0f * 3.14159265f / breath_period_steps_);
         }
 
-        if (BlinkAllowed()) {
+        if (blink_enabled_ && BlinkAllowed()) {
             if (now >= next_blink_ms_) {
                 uint32_t mult = SlowBlink() ? 2 : 1;
                 if (eye_closed_) {
@@ -583,8 +627,8 @@ private:
 
     void Draw() {
         if (!canvas_) return;
-        const lv_color_t bg = lv_color_make(0x00, 0x00, 0x00);
-        const lv_color_t fg = lv_color_make(0xFF, 0xFF, 0xFF);
+        const lv_color_t bg = lv_color_make(0x0B, 0x18, 0x2A);
+        const lv_color_t fg = lv_color_make(0xF4, 0xF7, 0xF2);
 
         lv_canvas_fill_bg(canvas_, bg, LV_OPA_COVER);
         lv_layer_t layer;
@@ -678,7 +722,19 @@ private:
         const int cy = 148 + (int)(breath_ * 3.0f);
         const int y_off = (int)(breath_ * 2.0f);
 
+        if (manual_mouth_) {
+            int h = 4 + (int)((60 - 4) * manual_mouth_open_);
+            int w = 50 + (int)((90 - 50) * (1.0f - manual_mouth_open_));
+            int radius = (int)(manual_mouth_open_ * 10);
+            FillRoundRect(layer, cx - w / 2, cy + y_off - h / 2, w, h, radius, fg);
+            return;
+        }
+
         switch (expression_) {
+            case Expression::Happy:
+                // A gentle curved smile reads better than the neutral bar.
+                DrawArc(layer, cx, cy + y_off - 2, 28, 180, 360, 5, fg, true);
+                return;
             case Expression::Cool:
                 DrawLine(layer, cx - 12, cy + y_off + 2, cx + 12, cy + y_off, 3, true, fg);
                 return;
@@ -859,8 +915,7 @@ private:
                 FillTriangle(layer, x0, y0, x1, y1, x2, y2, bg);
             }
 
-            if (expression_ == Expression::Happy
-                || expression_ == Expression::Kissy || expression_ == Expression::Funny
+            if (expression_ == Expression::Kissy || expression_ == Expression::Funny
                 || expression_ == Expression::Delicious) {
                 FillCircle(layer, cx_base + off_x, cy + off_y, r + 2, bg);
                 DrawArc(layer, cx_base + off_x, cy + off_y + r,
@@ -872,6 +927,12 @@ private:
     }
 
     void DrawOverlay(lv_layer_t* layer, lv_color_t fg, lv_color_t bg) {
+        if (expression_ == Expression::Happy) {
+            const lv_color_t blush = lv_color_make(0xE8, 0x8D, 0x9B);
+            DrawLine(layer, 46, 137, 57, 133, 3, true, blush);
+            DrawLine(layer, 269, 133, 280, 137, 3, true, blush);
+        }
+
         if (overlay_.tear) {
             const lv_color_t blue = lv_color_make(0x40, 0xA0, 0xFF);
             int tx = 90;
@@ -985,6 +1046,9 @@ private:
     bool eye_closed_ = false;
     float eye_open_ratio_ = 1.0f;
     float mouth_open_ = 0.0f;
+    bool blink_enabled_ = true;
+    bool manual_mouth_ = false;
+    float manual_mouth_open_ = 0.0f;
     float breath_ = 0.0f;
     float gaze_h_ = 0.0f;
     float gaze_v_ = 0.0f;
@@ -997,6 +1061,7 @@ private:
 static Expression MapEmotion(const char* e) {
     if (!e) return Expression::Neutral;
     if (!strcmp(e, "neutral"))     return Expression::Neutral;
+    if (!strcmp(e, "idle"))        return Expression::Happy;
     if (!strcmp(e, "happy"))       return Expression::Happy;
     if (!strcmp(e, "laughing"))    return Expression::Laughing;
     if (!strcmp(e, "funny"))       return Expression::Funny;
@@ -1068,6 +1133,23 @@ public:
     void SetFaceTracker(FaceTracker* ft) { face_tracker_ = ft; }
     void SetServo(StackChanServo* s) { servo_ = s; }
     void SetLedUpdater(std::function<void(const char*)> fn) { led_updater_ = std::move(fn); }
+
+    void SetupUI() override {
+        // Build the base LVGL widgets first, then replace the centered emoji
+        // layer with the full-screen StackChan line-art avatar.
+        SpiLcdDisplay::SetupUI();
+        TryInitAvatar();
+    }
+
+    void SetBlinkEnabled(bool enabled) {
+        DisplayLockGuard lock(this);
+        avatar_.SetBlinkEnabled(enabled);
+    }
+
+    void SetMouthShape(const char* shape) {
+        DisplayLockGuard lock(this);
+        avatar_.SetMouthShape(shape);
+    }
 
     void OnPetted() {
         if (!avatar_.IsReady()) return;
@@ -1221,6 +1303,13 @@ private:
         bool ok = avatar_.Init(screen, canvas_w_, canvas_h_);
         if (!ok) return;
 
+        avatar_.BringToFront();
+
+        // Apply the standby face immediately in case the first state change
+        // happened before the delayed avatar canvas was ready.
+        avatar_.SetExpression(shizhou_avatar::Expression::Happy);
+        avatar_.SetOverlay(shizhou_avatar::OverlayFor("happy"));
+
         lv_obj_set_style_bg_opa(container_, LV_OPA_TRANSP, 0);
         if (content_) lv_obj_set_style_bg_opa(content_, LV_OPA_TRANSP, 0);
         if (emoji_box_) {
@@ -1353,7 +1442,10 @@ private:
     bool py32_found_ = false;
     // ---- PY32 持久 I2C 设备句柄（控 LED + 其他扩展）----
     i2c_master_dev_handle_t py32_dev_ = nullptr;
+    M5IOE1 m5ioe1_;
+    bool m5ioe1_ready_ = false;
     bool led_manual_ = false;
+    uint16_t led_frame_[12] = {};
     // ---- BMI270 (IMU) ----
     i2c_master_dev_handle_t bmi_i2c_dev_ = nullptr;
     struct bmi2_dev bmi_dev_storage_ = {};
@@ -1530,27 +1622,25 @@ private:
     // (Morning greeting + weather timer task removed; see git history.)
 
     // ---- PY32 IO Expander 控 WS2812 RGB LED ×12 ----
-    // 协议（来自 M5Stack/StackChan-BSP）:
-    //   REG_LED_CFG  (0x24): 低6位=LED数量, bit6=1 触发刷新
-    //   REG_LED_RAM  (0x30+): 颜色数据起点，每颗 LED 2 字节 RGB565 little-endian
-
     void InitializePy32LedDevice() {
-        i2c_device_config_t dev_cfg = {
-            .dev_addr_length = I2C_ADDR_BIT_LEN_7,
-            .device_address = 0x6F,
-            .scl_speed_hz = 100000,
-        };
-        if (i2c_master_bus_add_device(i2c_bus_, &dev_cfg, &py32_dev_) != ESP_OK) {
-            ESP_LOGW(TAG, "PY32 LED: add device failed");
-            py32_dev_ = nullptr;
+        const auto init = m5ioe1_.begin(
+            i2c_bus_, 0x6F, 100000, M5IOE1_INT_MODE_DISABLED);
+        if (init != M5IOE1_OK) {
+            ESP_LOGW(TAG, "PY32 LED: official M5IOE1 init failed: %d", init);
             return;
         }
-        // 设 LED 数量 = 12
-        uint8_t cmd[2] = {0x24, 12};
-        i2c_master_transmit(py32_dev_, cmd, 2, 200);
+        m5ioe1_.pinMode(13, OUTPUT);
+        m5ioe1_.setPullMode(13, M5IOE1_PULL_UP);
+        m5ioe1_.setDriveMode(13, M5IOE1_DRIVE_PUSHPULL);
+        const auto count = m5ioe1_.setLedCount(12);
+        if (count != M5IOE1_OK) {
+            ESP_LOGW(TAG, "PY32 LED: set LED count failed: %d", count);
+            return;
+        }
+        m5ioe1_ready_ = true;
         uint16_t off[12] = {};
         Py32SetLedFrame(off, 12);
-        ESP_LOGI(TAG, "PY32 LED ready (12 LEDs, off)");
+        ESP_LOGI(TAG, "PY32 LED ready via official M5IOE1 (12 LEDs, off)");
     }
 
     bool Py32WriteRegBlock(uint8_t reg, const uint8_t* data, size_t len) {
@@ -1563,17 +1653,22 @@ private:
     }
 
     bool Py32SetLedFrame(const uint16_t* rgb565_colors, size_t count) {
-        if (!py32_dev_) return false;
+        if (!m5ioe1_ready_) return false;
         if (count > 12) count = 12;
-        uint8_t data[24];
+        bool ok = true;
         for (size_t i = 0; i < count; i++) {
-            data[i * 2]     = rgb565_colors[i] & 0xFF;
-            data[i * 2 + 1] = (rgb565_colors[i] >> 8) & 0xFF;
+            const uint16_t color = rgb565_colors[i];
+            const uint8_t r = static_cast<uint8_t>(((color >> 11) & 0x1F) * 255 / 31);
+            const uint8_t g = static_cast<uint8_t>(((color >> 5) & 0x3F) * 255 / 63);
+            const uint8_t b = static_cast<uint8_t>((color & 0x1F) * 255 / 31);
+            if (m5ioe1_.setLedColor(i, r, g, b) != M5IOE1_OK) {
+                ok = false;
+                break;
+            }
         }
-        bool ok1 = Py32WriteRegBlock(0x30, data, count * 2);
-        uint8_t refresh = (uint8_t)(count | 0x40);
-        bool ok2 = Py32WriteRegBlock(0x24, &refresh, 1);
-        return ok1 && ok2;
+        if (ok && m5ioe1_.refreshLeds() != M5IOE1_OK) ok = false;
+        if (ok) memcpy(led_frame_, rgb565_colors, count * sizeof(led_frame_[0]));
+        return ok;
     }
 
     static uint16_t Rgb888To565(uint8_t r, uint8_t g, uint8_t b) {
@@ -1716,6 +1811,38 @@ private:
                 ESP_LOGI(TAG, "MCP face expression: %s", emotion.c_str());
                 return true;
             });
+
+        // Compatibility alias for the cloud gateway's generic avatar API.
+        mcp.AddTool("self.display.set_avatar",
+            "Set the on-screen facial expression.",
+            PropertyList({Property("face", kPropertyTypeString)}),
+            [this](const PropertyList& props) -> ReturnValue {
+                auto face = props["face"].value<std::string>();
+                auto display = GetDisplay();
+                if (display) display->SetEmotion(face.c_str());
+                return true;
+            });
+
+        mcp.AddTool("self.display.set_blink",
+            "Enable or disable avatar blinking.",
+            PropertyList({Property("enabled", kPropertyTypeBoolean)}),
+            [this](const PropertyList& props) -> ReturnValue {
+                auto* display = static_cast<M5StackAvatarDisplay*>(GetDisplay());
+                if (!display) return false;
+                display->SetBlinkEnabled(props["enabled"].value<bool>());
+                return true;
+            });
+
+        mcp.AddTool("self.display.set_mouth",
+            "Set the avatar mouth shape. Supported shapes: closed, half, open, e, u.",
+            PropertyList({Property("mouth", kPropertyTypeString)}),
+            [this](const PropertyList& props) -> ReturnValue {
+                auto* display = static_cast<M5StackAvatarDisplay*>(GetDisplay());
+                if (!display) return false;
+                auto mouth = props["mouth"].value<std::string>();
+                display->SetMouthShape(mouth.c_str());
+                return true;
+            });
     }
 
     void RegisterLedMcpTools() {
@@ -1734,21 +1861,90 @@ private:
                 uint16_t color = Rgb888To565(r, g, b);
                 uint16_t colors[12];
                 for (int i = 0; i < 12; i++) colors[i] = color;
-                Py32SetLedFrame(colors, 12);
-                led_manual_ = true;
-                ESP_LOGI(TAG, "MCP set LED color: r=%d g=%d b=%d", r, g, b);
-                return true;
+                bool ok = Py32SetLedFrame(colors, 12);
+                if (ok) led_manual_ = true;
+                ESP_LOGI(TAG, "MCP set LED color: r=%d g=%d b=%d ok=%s",
+                    r, g, b, ok ? "true" : "false");
+                return ok;
             });
         mcp.AddTool("self.led.turn_off",
             "Turn off the LED ring light.",
             PropertyList(),
             [this](const PropertyList&) -> ReturnValue {
                 uint16_t off[12] = {};
-                Py32SetLedFrame(off, 12);
-                led_manual_ = true;
-                ESP_LOGI(TAG, "MCP LED off");
-                return true;
+                bool ok = Py32SetLedFrame(off, 12);
+                if (ok) led_manual_ = true;
+                ESP_LOGI(TAG, "MCP LED off ok=%s", ok ? "true" : "false");
+                return ok;
             });
+
+        mcp.AddTool("self.led.set_single",
+            "Set one LED in the ring. Index is 0-11; colors use RGB values from 0 to 255.",
+            PropertyList({
+                Property("index", kPropertyTypeInteger, 0, 0, 11),
+                Property("r", kPropertyTypeInteger, 0, 255),
+                Property("g", kPropertyTypeInteger, 0, 255),
+                Property("b", kPropertyTypeInteger, 0, 255),
+            }),
+            [this](const PropertyList& props) -> ReturnValue {
+                int index = props["index"].value<int>();
+                uint16_t next[12];
+                memcpy(next, led_frame_, sizeof(next));
+                next[index] = Rgb888To565(
+                    props["r"].value<int>(),
+                    props["g"].value<int>(),
+                    props["b"].value<int>());
+                bool ok = Py32SetLedFrame(next, 12);
+                if (ok) led_manual_ = true;
+                return ok;
+            });
+
+        mcp.AddTool("self.led.set_many",
+            "Set the LED ring from a JSON array of RGB triples, for example [[255,0,0],[0,0,255]].",
+            PropertyList({Property("colors_json", kPropertyTypeString)}),
+            [this](const PropertyList& props) -> ReturnValue {
+                auto encoded = props["colors_json"].value<std::string>();
+                cJSON* root = cJSON_Parse(encoded.c_str());
+                if (!root || !cJSON_IsArray(root)) {
+                    cJSON_Delete(root);
+                    ESP_LOGW(TAG, "MCP LED set_many: expected JSON array");
+                    return false;
+                }
+                int count = cJSON_GetArraySize(root);
+                if (count < 1 || count > 12) {
+                    cJSON_Delete(root);
+                    ESP_LOGW(TAG, "MCP LED set_many: expected 1..12 colors, got %d", count);
+                    return false;
+                }
+                uint16_t next[12];
+                memcpy(next, led_frame_, sizeof(next));
+                for (int i = 0; i < count; ++i) {
+                    cJSON* triple = cJSON_GetArrayItem(root, i);
+                    if (!cJSON_IsArray(triple) || cJSON_GetArraySize(triple) != 3) {
+                        cJSON_Delete(root);
+                        return false;
+                    }
+                    cJSON* r = cJSON_GetArrayItem(triple, 0);
+                    cJSON* g = cJSON_GetArrayItem(triple, 1);
+                    cJSON* b = cJSON_GetArrayItem(triple, 2);
+                    if (!cJSON_IsNumber(r) || !cJSON_IsNumber(g) || !cJSON_IsNumber(b)
+                        || r->valuedouble < 0 || r->valuedouble > 255
+                        || g->valuedouble < 0 || g->valuedouble > 255
+                        || b->valuedouble < 0 || b->valuedouble > 255) {
+                        cJSON_Delete(root);
+                        return false;
+                    }
+                    next[i] = Rgb888To565(
+                        static_cast<uint8_t>(r->valueint),
+                        static_cast<uint8_t>(g->valueint),
+                        static_cast<uint8_t>(b->valueint));
+                }
+                cJSON_Delete(root);
+                bool ok = Py32SetLedFrame(next, 12);
+                if (ok) led_manual_ = true;
+                return ok;
+            });
+
         mcp.AddTool("self.led.auto",
             "Set LED back to automatic emotion-based color mode.",
             PropertyList(),
@@ -1797,6 +1993,36 @@ private:
                 return true;
             });
 
+        // Compatibility aliases used by the cloud gateway's generic robot API.
+        mcp.AddTool("self.robot.set_head_angles",
+            "Move the head to yaw/pitch angles and hold the position.",
+            PropertyList({
+                Property("yaw", kPropertyTypeInteger, 0, -90, 90),
+                Property("pitch", kPropertyTypeInteger, 30, 5, 85),
+                Property("speed_dps", kPropertyTypeInteger, 120, 1, 240),
+            }),
+            [this, move_with_pause](const PropertyList& props) -> ReturnValue {
+                int yaw = props["yaw"].value<int>();
+                int pitch = props["pitch"].value<int>();
+                int speed = props["speed_dps"].value<int>();
+                int distance = std::max(
+                    std::abs(yaw - servo_.GetCurrentYaw()),
+                    std::abs(pitch - servo_.GetCurrentPitch()));
+                int time_ms = std::max(150, distance * 1000 / std::max(1, speed));
+                move_with_pause(yaw, pitch, time_ms);
+                return true;
+            });
+
+        mcp.AddTool("self.robot.get_head_angles",
+            "Read the last commanded head yaw and pitch angles.",
+            PropertyList(),
+            [this](const PropertyList&) -> ReturnValue {
+                cJSON* json = cJSON_CreateObject();
+                cJSON_AddNumberToObject(json, "yaw", servo_.GetCurrentYaw());
+                cJSON_AddNumberToObject(json, "pitch", servo_.GetCurrentPitch());
+                return json;
+            });
+
         mcp.AddTool("self.head.center",
             "Move the head back to center/forward position AND release the manual lock "
             "so face tracking can resume. Use when user says 'reset/center your head', "
@@ -1842,6 +2068,24 @@ private:
                 servo_.Shake();
                 ESP_LOGI(TAG, "MCP head shake");
                 return true;
+            });
+    }
+
+    void RegisterTouchMcpTools() {
+        auto& mcp = McpServer::GetInstance();
+        mcp.AddTool("self.touch.get_touch_state",
+            "Read the current three-zone capacitive touch state.",
+            PropertyList(),
+            [this](const PropertyList&) -> ReturnValue {
+                cJSON* json = cJSON_CreateObject();
+                cJSON_AddNumberToObject(json, "raw", si12t_last_state_);
+                for (int zone = 0; zone < 3; ++zone) {
+                    int value = (si12t_last_state_ >> (zone * 2)) & 0x03;
+                    char name[16];
+                    snprintf(name, sizeof(name), "zone_%d", zone);
+                    cJSON_AddNumberToObject(json, name, value);
+                }
+                return json;
             });
     }
 
@@ -2360,17 +2604,15 @@ public:
         if (servo_ok_) {
             avatar_display->SetServo(&servo_);
         }
-        if (camera_ && camera_->IsOk() && servo_ok_) {
-            face_tracker_.Start(camera_, &servo_);
-            servo_.SetFaceTracker(&face_tracker_);
-            avatar_display->SetFaceTracker(&face_tracker_);
-        }
+        // Automatic camera-driven head tracking is disabled. Head movement is
+        // available only through explicit MCP commands.
         avatar_display->SetLedUpdater([this](const char* emotion) {
             UpdateLedsFromEmotion(emotion);
         });
         InitializeFt6336TouchPad();
         InitializeBmi270();
         InitializeSi12T();
+        RegisterTouchMcpTools();
         // Morning greeting + weather timer task removed; no-op call removed too
 
         esp_timer_create_args_t status_args = {};

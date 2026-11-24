@@ -404,7 +404,9 @@ void McpServer::ParseMessage(const cJSON* json) {
 }
 
 void McpServer::ReplyResult(int id, const std::string& result) {
-    std::string payload = "{\"jsonrpc\":\"2.0\",\"id\":";
+    std::string payload;
+    payload.reserve(32 + result.size());
+    payload = "{\"jsonrpc\":\"2.0\",\"id\":";
     payload += std::to_string(id) + ",\"result\":";
     payload += result;
     payload += "}";
@@ -412,7 +414,9 @@ void McpServer::ReplyResult(int id, const std::string& result) {
 }
 
 void McpServer::ReplyError(int id, const std::string& message) {
-    std::string payload = "{\"jsonrpc\":\"2.0\",\"id\":";
+    std::string payload;
+    payload.reserve(64 + message.size());
+    payload = "{\"jsonrpc\":\"2.0\",\"id\":";
     payload += std::to_string(id);
     payload += ",\"error\":{\"message\":\"";
     payload += message;
@@ -421,8 +425,11 @@ void McpServer::ReplyError(int id, const std::string& message) {
 }
 
 void McpServer::GetToolsList(int id, const std::string& cursor, bool list_user_only_tools) {
-    const int max_payload_size = 8000;
+    // Keep each response below the CoreS3's available internal heap. The cloud
+    // gateway follows nextCursor, so smaller pages preserve all tools safely.
+    const int max_payload_size = 3000;
     std::string json = "{\"tools\":[";
+    json.reserve(max_payload_size + 64);
     
     bool found_cursor = cursor.empty();
     auto it = tools_.begin();

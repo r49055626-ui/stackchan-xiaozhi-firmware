@@ -312,7 +312,9 @@ void Application::HandleActivationDoneEvent() {
     // Release OTA object after activation is complete
     ota_.reset();
     auto& board = Board::GetInstance();
-    board.SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
+    // Keep Wi-Fi awake for the persistent MCP WebSocket; modem sleep causes
+    // the gateway keepalive to time out while the device is idle.
+    board.SetPowerSaveLevel(PowerSaveLevel::PERFORMANCE);
 
     Schedule([this]() {
         // Play the success sound to indicate the device is ready
@@ -497,7 +499,16 @@ void Application::InitializeProtocol() {
 
     protocol_->OnIncomingAudio([this](std::unique_ptr<AudioStreamPacket> packet) {
         if (GetDeviceState() == kDeviceStateSpeaking) {
+            static uint32_t audio_packet_count = 0;
+            if ((++audio_packet_count % 25) == 1) {
+                ESP_LOGI(TAG, "Incoming audio packet #%lu bytes=%u state=speaking",
+                    (unsigned long)audio_packet_count,
+                    (unsigned)packet->payload.size());
+            }
             audio_service_.PushPacketToDecodeQueue(std::move(packet));
+        } else {
+            ESP_LOGW(TAG, "Dropping incoming audio: device state is not speaking (%d)",
+                (int)GetDeviceState());
         }
     });
 
@@ -510,7 +521,9 @@ void Application::InitializeProtocol() {
     });
 
     protocol_->OnAudioChannelClosed([this, &board]() {
-        board.SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
+        // Keep Wi-Fi awake after a transient WebSocket drop so the persistent
+        // MCP channel can be reopened without waiting for a wake interaction.
+        board.SetPowerSaveLevel(PowerSaveLevel::PERFORMANCE);
         Schedule([this]() {
             auto display = Board::GetInstance().GetDisplay();
             display->SetChatMessage("system", "");
@@ -524,11 +537,13 @@ void Application::InitializeProtocol() {
         if (strcmp(type->valuestring, "tts") == 0) {
             auto state = cJSON_GetObjectItem(root, "state");
             if (strcmp(state->valuestring, "start") == 0) {
+                ESP_LOGI(TAG, "TTS start received");
                 Schedule([this]() {
                     aborted_ = false;
                     SetDeviceState(kDeviceStateSpeaking);
                 });
             } else if (strcmp(state->valuestring, "stop") == 0) {
+                ESP_LOGI(TAG, "TTS stop received");
                 Schedule([this]() {
                     if (GetDeviceState() == kDeviceStateSpeaking) {
                         if (listening_mode_ == kListeningModeManualStop) {
@@ -654,7 +669,7 @@ void Application::DismissAlert() {
     if (GetDeviceState() == kDeviceStateIdle) {
         auto display = Board::GetInstance().GetDisplay();
         display->SetStatus(Lang::Strings::STANDBY);
-        display->SetEmotion("neutral");
+        display->SetEmotion("happy");
         display->SetChatMessage("system", "");
     }
 }
@@ -871,7 +886,7 @@ void Application::HandleStateChangedEvent() {
         case kDeviceStateIdle:
             display->SetStatus(Lang::Strings::STANDBY);
             display->ClearChatMessages();  // Clear messages first
-            display->SetEmotion("neutral"); // Then set emotion (wechat mode checks child count)
+            display->SetEmotion("happy"); // A friendlier standby face
             audio_service_.EnableVoiceProcessing(false);
             audio_service_.EnableWakeWordDetection(true);
             break;

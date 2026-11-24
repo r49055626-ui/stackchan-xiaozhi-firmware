@@ -1004,6 +1004,7 @@ idf_component_register(SRCS ${SOURCES}
                         esp_driver_uart
                         esp_driver_spi
                         esp_driver_i2c
+                        m5ioe1
                         esp_driver_i2s
                         esp_driver_jpeg
                         esp_driver_ppa

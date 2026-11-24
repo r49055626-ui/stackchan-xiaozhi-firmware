@@ -74,7 +74,16 @@ void Protocol::SendStopListening() {
 }
 
 void Protocol::SendMcpMessage(const std::string& payload) {
-    std::string message = "{\"session_id\":\"" + session_id_ + "\",\"type\":\"mcp\",\"payload\":" + payload + "}";
+    // MCP tool-list replies are relatively large. Build the envelope in one
+    // allocation so transient string concatenations do not exhaust the
+    // fragmented heap on the ESP32-S3.
+    std::string message;
+    message.reserve(40 + session_id_.size() + payload.size());
+    message = "{\"session_id\":\"";
+    message += session_id_;
+    message += "\",\"type\":\"mcp\",\"payload\":";
+    message += payload;
+    message += "}";
     SendText(message);
 }
 

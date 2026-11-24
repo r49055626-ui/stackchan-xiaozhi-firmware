@@ -21,8 +21,9 @@ WebsocketProtocol::~WebsocketProtocol() {
 }
 
 bool WebsocketProtocol::Start() {
-    // Only connect to server when audio channel is needed
-    return true;
+    // MCP uses this same WebSocket as a persistent device control channel.
+    // Keep it open after activation so the cloud gateway can discover tools.
+    return OpenAudioChannel();
 }
 
 bool WebsocketProtocol::SendAudio(std::unique_ptr<AudioStreamPacket> packet) {
@@ -76,11 +77,18 @@ bool WebsocketProtocol::IsAudioChannelOpened() const {
 }
 
 void WebsocketProtocol::CloseAudioChannel(bool send_goodbye) {
-    (void)send_goodbye;  // Websocket doesn't need to send goodbye message
-    websocket_.reset();
+    (void)send_goodbye;
+    // The cloud MCP gateway uses this socket as a persistent control channel.
+    // Keep it alive after a voice interaction instead of dropping MCP access.
 }
 
 bool WebsocketProtocol::OpenAudioChannel() {
+    // Voice actions may ask to open the audio channel while MCP is already
+    // connected. Reuse the existing socket so the gateway is not replaced.
+    if (websocket_ != nullptr && websocket_->IsConnected()) {
+        return true;
+    }
+
     Settings settings("websocket", false);
     std::string url = settings.GetString("url");
     std::string token = settings.GetString("token");
@@ -162,6 +170,13 @@ bool WebsocketProtocol::OpenAudioChannel() {
             }
             cJSON_Delete(root);
         }
+        last_incoming_time_ = std::chrono::steady_clock::now();
+    });
+
+    // The gateway keeps this persistent MCP socket alive with WebSocket
+    // heartbeat frames. A Pong is valid traffic too; otherwise the generic
+    // protocol timeout incorrectly marks an idle but healthy socket stale.
+    websocket_->OnPong([this](const char*, size_t) {
         last_incoming_time_ = std::chrono::steady_clock::now();
     });
 

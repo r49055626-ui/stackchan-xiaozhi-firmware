@@ -235,6 +235,9 @@ std::string Esp32Camera::Explain(const std::string &question) {
 
     auto network = Board::GetInstance().GetNetwork();
     auto http = network->CreateHttp(3);
+    // Camera upload must not block the MCP/WebSocket task long enough for the
+    // gateway keepalive to expire. Fail fast and let the caller retry.
+    http->SetTimeout(8000);
     std::string boundary = "----ESP32_CAMERA_BOUNDARY";
 
     http->SetHeader("Device-Id", SystemInfo::GetMacAddress().c_str());
